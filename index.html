@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Detektor Emosi Siswa - Simple</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto; margin: 12px; background:#f7f8fb; color:#111; }
+  .row { display:flex; gap:12px; align-items:flex-start; }
+  #video { border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.08); }
+  .card { background:white; padding:12px; border-radius:10px; box-shadow: 0 4px 18px rgba(15,15,15,0.06); }
+  label { font-weight:600; display:block; margin-bottom:6px; }
+  input, button, select, textarea { font-size:14px; padding:8px; border-radius:6px; border:1px solid #ddd; width:100%; box-sizing:border-box; }
+  #log { max-height:240px; overflow:auto; font-size:13px; background:#fafafa; padding:8px; border-radius:6px; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { padding:8px; border-bottom:1px solid #eee; text-align:left; font-size:13px; }
+  .small { font-size:12px; color:#555; }
+  .controls { display:flex; gap:8px; margin-top:8px; }
+</style>
+</head>
+<body>
+  <h2>Detektor Emosi Siswa (Webcam + Self-report)</h2>
+  <p class="small">Simpan file ini, download model face-api (lihat petunjuk), lalu buka di browser Chrome/Edge. Pastikan izinkan kamera.</p>
+
+  <div class="row">
+    <div class="card" style="flex:1;">
+      <label>Nama Siswa (untuk log)</label>
+      <input id="studentName" placeholder="Masukkan nama siswa, contoh: Ahmad - XI RPL" />
+
+      <div style="margin-top:10px; display:flex; gap:8px;">
+        <button id="startBtn">Mulai Deteksi</button>
+        <button id="stopBtn" disabled>Hentikan</button>
+        <button id="exportBtn">Ekspor CSV</button>
+      </div>
+
+      <div style="margin-top:10px;">
+        <label>Mode</label>
+        <select id="modeSelect">
+          <option value="webcam">Webcam (wajah)</option>
+          <option value="self">Self-report (ketik perasaan)</option>
+        </select>
+      </div>
+
+      <div id="selfReportArea" style="display:none; margin-top:10px;">
+        <label>Tulis perasaan siswa (1-2 kalimat)</label>
+        <textarea id="selfText" rows="3" placeholder="Mis: Saya merasa sedih karena PR banyak"></textarea>
+        <div class="controls">
+          <button id="submitSelf">Kirim Self-Report</button>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <label>Log / Rekap</label>
+        <div id="log"></div>
+      </div>
+    </div>
+
+    <div class="card" style="width:520px;">
+      <video id="video" width="480" height="360" autoplay muted></video>
+      <canvas id="overlay" width="480" height="360" style="position:relative; margin-top:8px;"></canvas>
+
+      <div style="margin-top:10px;">
+        <label>Rekap Emosi Per Siswa</label>
+        <div id="summary"></div>
+      </div>
+      <div style="margin-top:8px;" class="small">
+        Catatan: untuk akurasi lebih baik, pastikan wajah terlihat jelas, pencahayaan memadai, dan gunakan satu siswa per sesi.
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  Simple Emotion Detector using face-api.js
+  - Requires face-api model files in folder: ./models (see README below)
+  - Fall-back: simple word-list sentiment for self-report
+*/
+
+let detecting = false;
+let detectionsInterval = null;
+const logEl = document.getElementById('log');
+const summaryEl = document.getElementById('summary');
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const studentNameInput = document.getElementById('studentName');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const exportBtn = document.getElementById('exportBtn');
+const modeSelect = document.getElementById('modeSelect');
+const selfReportArea = document.getElementById('selfReportArea');
+const selfText = document.getElementById('selfText');
+const submitSelf = document.getElementById('submitSelf');
+
+let logData = []; // {time, student, source, emotion, confidence, raw}
+let summary = {}; // student -> {emotion:count}
+
+const EMOTIONS = ['neutral','happy','sad','angry','fearful','disgusted','surprised'];
+
+// --- small lexicon for self-report (Indonesian common words) ---
+const posWords = ['senang','bahagia','gembira','puas','baik','tenang','semangat','senyum','tertarik'];
+const negWords = ['sedih','marah','kecewa','stress','stres','khawatir','takut','jengkel','bosan','lelah','sakit','galau'];
+
+function addLogRow(obj) {
+  logData.push(obj);
+  // update log area
+  const mm = new Date(obj.time).toLocaleString();
+  const row = document.createElement('div');
+  row.innerHTML = `<strong>[${mm}]</strong> <em>${escapeHtml(obj.student||'Unknown')}</em> — ${escapeHtml(obj.source)} → <strong>${escapeHtml(obj.emotion)}</strong> ${obj.confidence ? '('+obj.confidence.toFixed(2)+')' : ''}`;
+  logEl.prepend(row);
+  // update summary
+  const s = obj.student || 'Unknown';
+  if (!summary[s]) { summary[s] = {}; EMOTIONS.forEach(e => summary[s][e]=0); }
+  if (!summary[s][obj.emotion]) summary[s][obj.emotion]=0;
+  summary[s][obj.emotion]++;
+  renderSummary();
+}
+
+function renderSummary() {
+  summaryEl.innerHTML = '';
+  const table = document.createElement('table');
+  const header = document.createElement('tr');
+  header.innerHTML = '<th>Siswa</th>' + EMOTIONS.map(e=>`<th>${e}</th>`).join('');
+  table.appendChild(header);
+  for (const s of Object.keys(summary)) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${escapeHtml(s)}</td>` + EMOTIONS.map(e=>`<td>${summary[s][e]||0}</td>`).join('');
+    table.appendChild(tr);
+  }
+  summaryEl.appendChild(table);
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
+
+// --- Self-report handling ---
+submitSelf.addEventListener('click', ()=>{
+  const text = selfText.value.trim();
+  if (!text) { alert('Isi dulu teks perasaan.'); return; }
+  const student = (studentNameInput.value || 'Unknown').trim();
+  const detected = analyzeTextEmotion(text);
+  addLogRow({time:Date.now(), student, source:'self-report', emotion:detected.emotion, confidence:detected.confidence, raw:text});
+  selfText.value = '';
+});
+
+function analyzeTextEmotion(text) {
+  const t = text.toLowerCase();
+  let score = 0;
+  for (const w of posWords) if (t.includes(w)) score += 1;
+  for (const w of negWords) if (t.includes(w)) score -= 1;
+  // map to emotion
+  let emotion = 'neutral', confidence = Math.min(1, Math.abs(score)/3);
+  if (score > 0) emotion = 'happy';
+  else if (score < 0) emotion = 'sad';
+  return {emotion, confidence};
+}
+
+// --- Webcam + face-api integration ---
+async function initModels() {
+  // face-api loads models from ./models by default
+  // models required: tiny_face_detector, face_expression_model
+  const base = './models';
+  try {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(base);
+    await faceapi.nets.faceExpressionNet.loadFromUri(base);
+    return true;
+  } catch (e) {
+    console.error('Gagal load model:', e);
+    alert('Gagal memuat model face-api. Pastikan folder ./models berisi model. Lihat petunjuk di bawah halaman.');
+    return false;
+  }
+}
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+    return true;
+  } catch (e) {
+    alert('Tidak dapat mengakses kamera: ' + e.message);
+    return false;
+  }
+}
+
+async function startDetectionLoop() {
+  const student = (studentNameInput.value || 'Unknown').trim();
+  detecting = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  detectionsInterval = setInterval(async ()=>{
+    if (video.readyState < 2) return;
+    const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.5 });
+    const result = await faceapi.detectSingleFace(video, options).withFaceExpressions();
+    ctx.clearRect(0,0,overlay.width,overlay.height);
+    if (result) {
+      const box = result.detection.box;
+      ctx.strokeStyle = '#00aaff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(box.x, box.y, box.width, box.height);
+      // get top expression
+      const expressions = result.expressions;
+      let top = {emotion:'neutral', prob:0};
+      for (const [k,v] of Object.entries(expressions)) {
+        if (v > top.prob) { top = {emotion:k, prob:v}; }
+      }
+      // map face-api labels to our EMOTIONS list: face-api uses: neutral, happy, sad, angry, fearful, disgusted, surprised
+      addLogRow({time:Date.now(), student, source:'webcam', emotion:top.emotion, confidence:top.prob, raw: JSON.stringify(expressions)});
+    }
+  }, 1500); // every 1.5s
+}
+
+function stopDetectionLoop() {
+  detecting = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  if (detectionsInterval) { clearInterval(detectionsInterval); detectionsInterval = null; }
+  // stop camera tracks
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t=>t.stop());
+    video.srcObject = null;
+  }
+  ctx.clearRect(0,0,overlay.width, overlay.height);
+}
+
+// --- Buttons ---
+startBtn.addEventListener('click', async ()=>{
+  const mode = modeSelect.value;
+  if (!studentNameInput.value.trim()) {
+    if (!confirm('Belum memasukkan nama siswa. Lanjutkan dengan nama "Unknown"?')) return;
+  }
+  if (mode === 'webcam') {
+    // init models and camera
+    startBtn.disabled = true;
+    const ok = await initModels();
+    if (!ok) { startBtn.disabled=false; return; }
+    const camOk = await startCamera();
+    if (!camOk) { startBtn.disabled=false; return; }
+    await startDetectionLoop();
+  } else {
+    // self-report mode: just show area
+    selfReportArea.style.display = 'block';
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+});
+
+stopBtn.addEventListener('click', ()=>{
+  const mode = modeSelect.value;
+  if (mode === 'webcam') stopDetectionLoop();
+  else {
+    selfReportArea.style.display = 'none';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+});
+
+modeSelect.addEventListener('change', ()=>{
+  if (modeSelect.value === 'self') {
+    selfReportArea.style.display = 'block';
+  } else selfReportArea.style.display = 'none';
+});
+
+exportBtn.addEventListener('click', ()=>{
+  if (logData.length === 0) { alert('Belum ada data untuk diekspor.'); return; }
+  const rows = [['time','student','source','emotion','confidence','raw']];
+  for (const r of logData) rows.push([new Date(r.time).toISOString(), r.student, r.source, r.emotion, r.confidence||'', r.raw||'']);
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'emotion_log.csv'; a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+
+<!-- face-api.js (minified) from CDN; still need model files in ./models -->
+<script defer src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+<hr style="margin-top:18px;" />
+<div class="small card" style="margin-top:12px;">
+  <strong>Petunjuk pemasangan model (satu kali):</strong>
+  <ol>
+    <li>Download model face-api dari repositori: <code>https://github.com/justadudewhohacks/face-api.js/tree/master/weights</code> (file: <code>tiny_face_detector_model-weights_manifest.json</code>, <code>tiny_face_detector_model-shard1</code>, dan file untuk <code>face_expression_model</code>). Simpan semua file model ke folder bernama <code>models</code> yang berada di lokasi sama dengan file HTML ini.</li>
+    <li>Struktur: <code>/emotion_detector.html</code> dan <code>/models/tiny_face_detector_model-*</code>, <code>/models/face_expression_model-*</code>.</li>
+    <li>Buka file HTML langsung (file://) di browser modern (Chrome/Edge). Jika model gagal dimuat karena pembatasan file://, jalankan server lokal sederhana: <code>python -m http.server 8000</code> lalu buka <code>http://localhost:8000/emotion_detector.html</code>.</li>
+  </ol>
+  <strong>Catatan penting:</strong> Aplikasi mendeteksi ekspresi wajah (bukan keadaan batin pasti). Gunakan data ini sebagai indikasi awal dan selalu konfirmasi dengan murid. Hormati privasi dan minta persetujuan orang tua jika perlu.
+</div>
+</body>
+</html>
